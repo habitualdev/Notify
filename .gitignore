@@ -1,0 +1,4 @@
+.idea
+build
+client/fyne-cross
+server/fyne-cross
