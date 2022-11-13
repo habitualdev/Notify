@@ -1,11 +1,10 @@
 package main
 
-import "time"
-
 type Notification struct {
 	Title    string
 	Content  string
-	PostTime time.Time
+	PostTime string
+	Checksum string
 }
 
 type Notifications []Notification

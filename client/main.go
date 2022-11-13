@@ -5,10 +5,13 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,6 +22,9 @@ var (
 	updateInterval = 15 * time.Second
 	version        = "0.1.0"
 	notes          []*fyne.Notification
+	notelock       sync.Mutex
+	checksums      []string
+	endpoints      []string
 )
 
 func main() {
@@ -65,7 +71,14 @@ func main() {
 		}
 	}
 
-	config := container.NewGridWithRows(4, watchSiteEntry, usernameEntry, passwordEntry, updateIntervalEntry)
+	endpointEntry := widget.NewEntry()
+	endpointEntry.SetPlaceHolder("Endpoint")
+	endpointEntry.OnChanged = func(s string) {
+		endpoints = strings.Split(strings.Replace(s, " ", "", -1), ",")
+
+	}
+
+	config := container.NewGridWithRows(5, watchSiteEntry, endpointEntry, usernameEntry, passwordEntry, updateIntervalEntry)
 	configVscroll := container.NewVScroll(config)
 	// Notification Block
 	notificationList := widget.NewList(
@@ -81,6 +94,19 @@ func main() {
 			o.(*widget.RichText).ParseMarkdown(notes[i].Title + "\n\n" + notes[i].Content)
 		})
 
+	notificationList.OnSelected = func(id widget.ListItemID) {
+		d := dialog.NewConfirm("Confirm", "Mark as read?", func(b bool) {
+			if b {
+				notelock.Lock()
+				notes = append(notes[:id], notes[id+1:]...)
+				notelock.Unlock()
+				notificationList.Refresh()
+			}
+		}, w)
+		d.Show()
+		notificationList.Unselect(id)
+	}
+
 	tabMenu := container.NewAppTabs(
 		container.NewTabItem("Notifications", notificationList),
 		container.NewTabItem("Config", configVscroll),
@@ -90,10 +116,28 @@ func main() {
 
 	go func() {
 		for {
-			for _, n := range GetUpdates() {
-				a.SendNotification(n)
+			notelock.Lock()
+			newNotes := GetUpdates()
+
+			for _, n := range newNotes {
+				if len(notes) == 0 {
+					notes = append(notes, n)
+					notificationList.Refresh()
+
+				} else {
+					for _, note := range notes {
+						if note.Content == n.Content && note.Title == n.Title {
+							println("Duplicate")
+							continue
+						} else {
+							a.SendNotification(n)
+							println("New Notification")
+							notes = append(notes, n)
+						}
+					}
+				}
 			}
-			notes = GetUpdates()
+			notelock.Unlock()
 			time.Sleep(updateInterval)
 			notificationList.Refresh()
 		}
@@ -103,30 +147,43 @@ func main() {
 }
 
 func GetUpdates() []*fyne.Notification {
-	if site == "" || username == "" || password == "" {
+	if site == "" || username == "" || password == "" || len(endpoints) == 0 {
+		println("No site, username, or password")
 		return []*fyne.Notification{fyne.NewNotification("Notify", "Please configure Notify")}
 	}
-	data, err := BasicAuthGet(site, username, password)
-	if err != nil {
-		return []*fyne.Notification{fyne.NewNotification("Error", err.Error())}
-	} else {
-		newNotifications := Notifications{}
-		err = json.Unmarshal(data, &newNotifications)
+	notifications := []*fyne.Notification{}
+	for _, endpoint := range endpoints {
+		data, err := BasicAuthGet(site, endpoint, username, password)
 		if err != nil {
 			return []*fyne.Notification{fyne.NewNotification("Error", err.Error())}
 		} else {
-			notifications := []*fyne.Notification{}
-			for _, n := range newNotifications {
-				notifications = append(notifications, fyne.NewNotification(n.Title, n.Content))
+			newNotifications := Notifications{}
+			err = json.Unmarshal(data, &newNotifications)
+			if err != nil {
+				return []*fyne.Notification{fyne.NewNotification("Error", err.Error())}
+			} else {
+
+				for _, n := range newNotifications {
+					newPost := true
+					for _, c := range checksums {
+						if c == n.Checksum {
+							newPost = false
+						}
+					}
+					if newPost {
+						notifications = append(notifications, fyne.NewNotification(n.Title, n.Content))
+						checksums = append(checksums, n.Checksum)
+					}
+				}
+
 			}
-			return notifications
 		}
 	}
-
+	return notifications
 }
 
-func BasicAuthGet(url string, username string, password string) ([]byte, error) {
-	req, err := http.NewRequest("GET", url, nil)
+func BasicAuthGet(url string, endpoint string, username string, password string) ([]byte, error) {
+	req, err := http.NewRequest("GET", url+"/"+endpoint, nil)
 	req.SetBasicAuth(username, password)
 	req.Header.Set("User-Agent", "GO-Notify/"+version)
 	client := &http.Client{}

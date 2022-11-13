@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,8 +22,11 @@ type application struct {
 	}
 }
 
-type NotificationStore map[string]Endpoint
-
+type Endpoints map[string]Endpoint
+type NotificationStore struct {
+	Endpoints
+	Mux sync.Mutex
+}
 type Endpoint struct {
 	Notifications []Notification
 }
@@ -59,7 +63,7 @@ var MainStore = NotificationStore{}
 
 func main() {
 	app := new(application)
-
+	MainStore.Endpoints = make(map[string]Endpoint)
 	configPath := flag.String("config", "notify-config.yaml", "Path to config file")
 	flag.Parse()
 
@@ -83,6 +87,7 @@ func main() {
 	}
 
 	coolOffDuration, err := time.ParseDuration(config.TimeOff)
+	fmt.Println(coolOffDuration)
 	if err != nil {
 		log.Fatal("timeoff must be provided in the correct format (e.g. 1h30m)")
 	}
@@ -144,16 +149,15 @@ func (app *application) basicAuth(next http.HandlerFunc) http.HandlerFunc {
 
 func GetHandler(uri string) Notifications {
 	notifications := Notifications{}
-	for k, n := range MainStore {
-		println(uri)
-		println(k)
+	MainStore.Mux.Lock()
+	for k, n := range MainStore.Endpoints {
 		if strings.Split(k, "?")[0] == strings.Split(uri, "?")[0] {
 			notifications = n.Notifications
-			fmt.Println(notifications)
-			println("Found")
+			MainStore.Mux.Unlock()
 			return notifications
 		}
 	}
+	MainStore.Mux.Unlock()
 	return notifications
 }
 
@@ -165,20 +169,29 @@ func PostHandler(uri string, request http.Request) string {
 	if request.FormValue("content") == "" {
 		return "Content is required"
 	}
-	for y, n := range MainStore {
+	MainStore.Mux.Lock()
+	println("Locking")
+	for y, n := range MainStore.Endpoints {
 		if y == strings.Split(uri, "?")[0] {
 			notifications = n.Notifications
-			notifications = append(notifications, Notification{Title: request.FormValue("title"), Content: request.FormValue("content")})
-			MainStore[y] = Endpoint{notifications}
+			checksum := sha256.New()
+			checksum.Write([]byte(request.FormValue("title") + request.FormValue("content") + time.Now().Format(time.RFC3339)))
+			checksumHex := fmt.Sprintf("%x", checksum.Sum(nil))
+			notifications = append(notifications, Notification{Title: request.FormValue("title"),
+				Content: request.FormValue("content"), Checksum: checksumHex, PostTime: time.Now().Format(time.RFC3339)})
+			MainStore.Endpoints[y] = Endpoint{notifications}
+			MainStore.Mux.Unlock()
 			return "Success"
 		}
 	}
-	MainStore[strings.Split(uri, "?")[0]] = Endpoint{Notifications{Notification{
+
+	MainStore.Endpoints[strings.Split(uri, "?")[0]] = Endpoint{Notifications{Notification{
 		Title:    request.FormValue("title"),
 		Content:  request.FormValue("content"),
-		PostTime: time.Now(),
+		PostTime: time.Now().Format(time.RFC3339),
 	}}}
-	fmt.Printf("%v", MainStore)
+	MainStore.Mux.Unlock()
+	println("unlocked")
 	return "Success"
 
 }
@@ -186,13 +199,29 @@ func PostHandler(uri string, request http.Request) string {
 func NotificationCleanup(coolOff time.Duration) {
 	for {
 		time.Sleep(10 * time.Second)
-		for k, n := range MainStore {
+		MainStore.Mux.Lock()
+		println("Locking - cleanup")
+		for k, n := range MainStore.Endpoints {
+			tempNotifications := Endpoint{}
 			for i, v := range n.Notifications {
-				if time.Since(v.PostTime) > coolOff {
-					n.Notifications = append(n.Notifications[:i], n.Notifications[i+1:]...)
-					MainStore[k] = n
+				parsedTime, err := time.Parse(time.RFC3339, v.PostTime)
+				if err != nil {
+					log.Fatal(err)
+				}
+				if time.Since(parsedTime) > coolOff {
+					println(time.Now().Format(time.RFC3339))
+					println(parsedTime.String())
+					println(v.PostTime)
+					fmt.Println(time.Since(parsedTime))
+					continue
+				} else {
+					tempNotifications.Notifications = append(tempNotifications.Notifications, n.Notifications[i])
+
 				}
 			}
+			MainStore.Endpoints[k] = tempNotifications
 		}
+		println("Unlocking - cleanup")
+		MainStore.Mux.Unlock()
 	}
 }
